@@ -3,6 +3,7 @@ package character
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"time"
 
@@ -20,8 +21,66 @@ type MosaicSin struct {
 	BaseCharacter
 }
 
+type ChargeSkillConfigEntry struct {
+	skill            skill.ID
+	useSkill         bool
+	chargeState      state.State
+	chargesPerAttack int
+	desiredCharges   int
+}
+
+func (s MosaicSin) getChargeSkillConfig(ctx context.Status) map[skill.ID]ChargeSkillConfigEntry {
+	return map[skill.ID]ChargeSkillConfigEntry{
+		skill.TigerStrike: {
+			skill.TigerStrike,
+			ctx.CharacterCfg.Character.MosaicSin.UseTigerStrike,
+			state.State(stat.ProgressiveDamage),
+			1,
+			3,
+		},
+		skill.CobraStrike: {
+			skill.CobraStrike,
+			ctx.CharacterCfg.Character.MosaicSin.UseCobraStrike,
+			state.State(stat.ProgressiveSteal),
+			1,
+			3,
+		},
+		skill.PhoenixStrike: {
+			skill.PhoenixStrike,
+			true, // Always enabled
+			state.State(stat.ProgressiveOther),
+			1,
+			2, // Two charges, we want lightning
+		},
+		skill.ClawsOfThunder: {
+			skill.ClawsOfThunder,
+			ctx.CharacterCfg.Character.MosaicSin.UseClawsOfThunder,
+			state.State(stat.ProgressiveLightning),
+			2,
+			3,
+		},
+		skill.BladesOfIce: {
+			skill.BladesOfIce,
+			ctx.CharacterCfg.Character.MosaicSin.UseBladesOfIce,
+			state.State(stat.ProgressiveCold),
+			2,
+			3,
+		},
+		// Note: Be careful with this. As fists of fire levels up, it converts more and
+		// more of your physical damage to fire. You need physical damage for life leech!
+		skill.FistsOfFire: {
+			skill.FistsOfFire,
+			ctx.CharacterCfg.Character.MosaicSin.UseFistsOfFire,
+			state.State(stat.ProgressiveFire),
+			2,
+			3,
+		},
+	}
+}
+
 func (s MosaicSin) CheckKeyBindings() []skill.ID {
-	requireKeybindings := []skill.ID{skill.TigerStrike, skill.CobraStrike, skill.PhoenixStrike, skill.ClawsOfThunder, skill.BladesOfIce, skill.TomeOfTownPortal}
+	requireKeybindings := []skill.ID{skill.PhoenixStrike, skill.TomeOfTownPortal}
+
 	missingKeybindings := []skill.ID{}
 
 	for _, cskill := range requireKeybindings {
@@ -37,28 +96,76 @@ func (s MosaicSin) CheckKeyBindings() []skill.ID {
 	return missingKeybindings
 }
 
-func (s MosaicSin) KillMonsterSequence(
+func (s MosaicSin) hasKeyBindingForSkill(skill skill.ID) bool {
+	_, found := s.Data.KeyBindings.KeyBindingForSkill(skill)
+	return found
+}
+
+func (s MosaicSin) buildChargesForSkill(monsterId data.UnitID, skillConfig ChargeSkillConfigEntry, ctx context.Status) (int, bool) {
+	// The configuration checks for whether this skill is enabled are handled before we call this function
+
+	charges, found := ctx.Data.PlayerUnit.Stats.FindStat(stat.ID(skillConfig.chargeState), 0)
+	attacks := 0
+
+	if !s.MobAlive(monsterId, *s.Data) {
+		return -1, true
+	}
+
+	if s.hasKeyBindingForSkill(skillConfig.skill) {
+		if !found || (found && charges.Value < skillConfig.desiredCharges) {
+			neededCharges := skillConfig.desiredCharges - charges.Value
+			// Some skills give up to 2 charges per attack
+			plannedAttacks := (neededCharges + skillConfig.chargesPerAttack - 1) / skillConfig.chargesPerAttack
+			attacks += plannedAttacks
+			step.SecondaryAttack(skillConfig.skill, monsterId, plannedAttacks, step.StationaryDistance(1, 4))
+		}
+	}
+
+	return attacks, false
+}
+
+func (s MosaicSin) MobHasAnyState(mob data.UnitID, statesToFind []state.State) bool {
+	// TODO: this maybe has a home in d2go?
+	monster, found := s.Data.Monsters.FindByID(mob)
+	if found {
+		for _, stateToFind := range statesToFind {
+			if slices.Contains(monster.States, stateToFind) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s MosaicSin) AttackLoop(
 	monsterSelector func(d game.Data) (data.UnitID, bool),
 	skipOnImmunities []stat.Resist,
+	attackOrder []skill.ID,
+	skillConfig map[skill.ID]ChargeSkillConfigEntry,
+	ctx context.Status,
 ) error {
-	ctx := context.Get()
-	ctx.RefreshGameData()
+	ctx.Data.PlayerUnit = ctx.GameReader.GetData().Data.PlayerUnit
 	lastRefresh := time.Now()
+
+	// TODO: move to config?
+	attacksBeforeKick := 4
+	useCloakOfShadows := true
+
+	// Initial cloak of shadows cast for survivability
+	if id, found := monsterSelector(*s.Data); found {
+		// How do I determine if cloak of shadows is on cooldown?
+		if useCloakOfShadows && s.hasKeyBindingForSkill(skill.CloakOfShadows) &&
+			!s.MobHasAnyState(id, []state.State{state.Lifetap, state.CloakOfShadows}) {
+			step.SecondaryAttack(skill.CloakOfShadows, id, 1, step.StationaryDistance(1, 24))
+		}
+	}
 
 	for {
 		// Limit refresh rate to 10 times per second to avoid excessive CPU usage
 		if time.Since(lastRefresh) > time.Millisecond*100 {
-			ctx.RefreshGameData()
+			ctx.Data.PlayerUnit = ctx.GameReader.GetData().Data.PlayerUnit
 			lastRefresh = time.Now()
 		}
-
-		// Get the charges for each skill we're using
-		tigerCharges, foundTiger := ctx.Data.PlayerUnit.Stats.FindStat(stat.ProgressiveDamage, 0)
-		cobraCharges, foundCobra := ctx.Data.PlayerUnit.Stats.FindStat(stat.ProgressiveSteal, 0)
-		phoenixCharges, foundPhoenix := ctx.Data.PlayerUnit.Stats.FindStat(stat.ProgressiveOther, 0)
-		clawsCharges, foundClaws := ctx.Data.PlayerUnit.Stats.FindStat(stat.ProgressiveLightning, 0)
-		bladesCharges, foundBlades := ctx.Data.PlayerUnit.Stats.FindStat(stat.ProgressiveCold, 0)
-		firstCharges, foundFirst := ctx.Data.PlayerUnit.Stats.FindStat(stat.ProgressiveFire, 0)
 
 		id, found := monsterSelector(*s.Data)
 		if !found {
@@ -75,88 +182,91 @@ func (s MosaicSin) KillMonsterSequence(
 			return nil
 		}
 
-		// Initial move to monster if we're too far
-		if ctx.PathFinder.DistanceFromMe(monster.Position) > 3 {
-			if err := step.MoveTo(monster.Position); err != nil {
-				s.Logger.Debug("Failed to move to monster position", slog.String("error", err.Error()))
-				continue
-			}
-		}
-
 		if !s.MobAlive(id, *s.Data) {
 			return nil
 		}
 
-		// Tiger Strike - 3 charges
-		if ctx.CharacterCfg.Character.MosaicSin.UseTigerStrike {
-			if !s.Data.PlayerUnit.States.HasState(state.Tigerstrike) || (foundTiger && tigerCharges.Value < 3) {
-				step.SecondaryAttack(skill.TigerStrike, id, 1)
-				continue
+		totalAttacks := 0
+
+		for _, chargeSkill := range attackOrder {
+			if skillConfig[chargeSkill].useSkill && totalAttacks < attacksBeforeKick {
+				attackCount, alreadyDead := s.buildChargesForSkill(
+					id,
+					skillConfig[chargeSkill],
+					ctx,
+				)
+
+				if alreadyDead {
+					return nil
+				}
+
+				totalAttacks += attackCount
 			}
-		}
-
-		if !s.MobAlive(id, *s.Data) {
-			return nil
-		}
-
-		// Cobra Strike - 3 charges
-		if ctx.CharacterCfg.Character.MosaicSin.UseCobraStrike {
-			if !s.Data.PlayerUnit.States.HasState(state.Cobrastrike) || (foundCobra && cobraCharges.Value < 3) {
-				step.SecondaryAttack(skill.CobraStrike, id, 1)
-				continue
-			}
-		}
-
-		if !s.MobAlive(id, *s.Data) {
-			return nil
-		}
-
-		// Phoenix Strike - 2 charges
-		if !s.Data.PlayerUnit.States.HasState(state.Phoenixstrike) || (foundPhoenix && phoenixCharges.Value < 2) {
-			step.SecondaryAttack(skill.PhoenixStrike, id, 1)
-			continue
-		}
-
-		if !s.MobAlive(id, *s.Data) {
-			return nil
-		}
-
-		// Claws of Thunder - 3 charges
-		if ctx.CharacterCfg.Character.MosaicSin.UseClawsOfThunder {
-			if !s.Data.PlayerUnit.States.HasState(state.Clawsofthunder) || (foundClaws && clawsCharges.Value < 3) {
-				step.SecondaryAttack(skill.ClawsOfThunder, id, 1)
-				continue
-			}
-		}
-
-		if !s.MobAlive(id, *s.Data) {
-			return nil
-		}
-
-		// Blades of Ice - 3 charges
-		if ctx.CharacterCfg.Character.MosaicSin.UseBladesOfIce {
-			if !s.Data.PlayerUnit.States.HasState(state.Bladesofice) || (foundBlades && bladesCharges.Value < 3) {
-				step.SecondaryAttack(skill.BladesOfIce, id, 1)
-				continue
-			}
-		}
-
-		// First of Fire - 3 charges
-		if ctx.CharacterCfg.Character.MosaicSin.UseFistsOfFire {
-			if !s.Data.PlayerUnit.States.HasState(state.Fistsoffire) || (foundFirst && firstCharges.Value < 3) {
-				step.SecondaryAttack(skill.FistsOfFire, id, 1)
-				continue
-			}
-		}
-
-		if !s.MobAlive(id, *s.Data) {
-			return nil
 		}
 
 		opts := step.Distance(1, 2)
 		// Finish it off with primary attack
 		step.PrimaryAttack(id, 1, false, opts)
 	}
+}
+
+func (s MosaicSin) KillBossSequence(
+	monsterSelector func(d game.Data) (data.UnitID, bool),
+	skipOnImmunities []stat.Resist,
+) error {
+	chargeSkills := []skill.ID{
+		// skill.CobraStrike,
+		skill.PhoenixStrike, // We only want to use phoenix strike for bosses, but you can uncomment and reorder these if you desire.
+		// skill.ClawsOfThunder,
+		// skill.TigerStrike,
+		// skill.BladesOfIce,
+		// skill.FistsOfFire,
+	}
+
+	ctx := context.Get()
+	chargeSkillConfig := s.getChargeSkillConfig(*ctx)
+	// Override phoenix strike behavior for bosses
+	chargeSkillConfig[skill.PhoenixStrike] = ChargeSkillConfigEntry{
+		skill.PhoenixStrike,
+		true, // Always enabled
+		state.State(stat.ProgressiveOther),
+		1,
+		1, // We only want one charge of Phoenix strike for bosses
+	}
+
+	return s.AttackLoop(
+		monsterSelector,
+		skipOnImmunities,
+		chargeSkills,
+		chargeSkillConfig,
+		*ctx,
+	)
+}
+
+func (s MosaicSin) KillMonsterSequence(
+	monsterSelector func(d game.Data) (data.UnitID, bool),
+	skipOnImmunities []stat.Resist,
+) error {
+	// The order to charge our skills, if the skill is enabled. TODO: Order could be configurable
+	chargeSkills := []skill.ID{
+		skill.CobraStrike,
+		skill.PhoenixStrike,
+		skill.ClawsOfThunder,
+		skill.TigerStrike,
+		skill.BladesOfIce,
+		skill.FistsOfFire,
+	}
+
+	ctx := context.Get()
+	chargeSkillConfig := s.getChargeSkillConfig(*ctx)
+
+	return s.AttackLoop(
+		monsterSelector,
+		skipOnImmunities,
+		chargeSkills,
+		chargeSkillConfig,
+		*ctx,
+	)
 }
 
 func (s MosaicSin) MobAlive(mob data.UnitID, d game.Data) bool {
@@ -188,8 +298,8 @@ func (s MosaicSin) PreCTABuffSkills() []skill.ID {
 	return []skill.ID{}
 }
 
-func (s MosaicSin) killMonster(npc npc.ID, t data.MonsterType) error {
-	return s.KillMonsterSequence(func(d game.Data) (data.UnitID, bool) {
+func (s MosaicSin) killBoss(npc npc.ID, t data.MonsterType) error {
+	return s.KillBossSequence(func(d game.Data) (data.UnitID, bool) {
 		m, found := d.Monsters.FindOne(npc, t)
 		if !found {
 			return 0, false
@@ -199,19 +309,19 @@ func (s MosaicSin) killMonster(npc npc.ID, t data.MonsterType) error {
 }
 
 func (s MosaicSin) KillCountess() error {
-	return s.killMonster(npc.DarkStalker, data.MonsterTypeSuperUnique)
+	return s.killBoss(npc.DarkStalker, data.MonsterTypeSuperUnique)
 }
 
 func (s MosaicSin) KillAndariel() error {
-	return s.killMonster(npc.Andariel, data.MonsterTypeUnique)
+	return s.killBoss(npc.Andariel, data.MonsterTypeUnique)
 }
 
 func (s MosaicSin) KillSummoner() error {
-	return s.killMonster(npc.Summoner, data.MonsterTypeUnique)
+	return s.killBoss(npc.Summoner, data.MonsterTypeUnique)
 }
 
 func (s MosaicSin) KillDuriel() error {
-	return s.killMonster(npc.Duriel, data.MonsterTypeUnique)
+	return s.killBoss(npc.Duriel, data.MonsterTypeUnique)
 }
 
 func (s MosaicSin) KillCouncil() error {
@@ -238,11 +348,11 @@ func (s MosaicSin) KillCouncil() error {
 }
 
 func (s MosaicSin) KillMephisto() error {
-	return s.killMonster(npc.Mephisto, data.MonsterTypeUnique)
+	return s.killBoss(npc.Mephisto, data.MonsterTypeUnique)
 }
 
 func (s MosaicSin) KillIzual() error {
-	return s.killMonster(npc.Izual, data.MonsterTypeUnique)
+	return s.killBoss(npc.Izual, data.MonsterTypeUnique)
 }
 
 func (s MosaicSin) KillDiablo() error {
@@ -267,18 +377,18 @@ func (s MosaicSin) KillDiablo() error {
 
 		diabloFound = true
 		s.Logger.Info("Diablo detected, attacking")
-		return s.killMonster(npc.Diablo, data.MonsterTypeUnique)
+		return s.killBoss(npc.Diablo, data.MonsterTypeUnique)
 	}
 }
 
 func (s MosaicSin) KillPindle() error {
-	return s.killMonster(npc.DefiledWarrior, data.MonsterTypeSuperUnique)
+	return s.killBoss(npc.DefiledWarrior, data.MonsterTypeSuperUnique)
 }
 
 func (s MosaicSin) KillNihlathak() error {
-	return s.killMonster(npc.Nihlathak, data.MonsterTypeSuperUnique)
+	return s.killBoss(npc.Nihlathak, data.MonsterTypeSuperUnique)
 }
 
 func (s MosaicSin) KillBaal() error {
-	return s.killMonster(npc.BaalCrab, data.MonsterTypeUnique)
+	return s.killBoss(npc.BaalCrab, data.MonsterTypeUnique)
 }
